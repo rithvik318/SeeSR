@@ -1,0 +1,161 @@
+# Original SeeSR inference setup, expressed as an experiment config.
+#
+# Provenance tags used below:
+#   [upstream]  value copied from test_seesr.py argparse defaults or
+#               scripts/test_seesr.sh at upstream commit b13b8ac. The test
+#               suite (experiments/tests/test_configs.py) checks every
+#               `inference` value against the argparse defaults.
+#   [exp]       experiment-specific choice made by this framework.
+#   [user]      must be set by you (paths depend on your storage layout).
+#
+# Relative paths are resolved against the repository root.
+
+experiment:
+  name: baseline_ddpm50                       # [exp]
+  description: Original SeeSR, DDPM, 50 steps, upstream defaults.
+
+models:
+  # [upstream] locations used by scripts/test_seesr.sh. [user] place the
+  # downloaded weights there (or symlink preset/models to Google Drive).
+  pretrained_model_path: preset/models/stable-diffusion-2-base
+  seesr_model_path: preset/models/seesr
+  ram_ft_path: preset/models/DAPE.pth
+  # [upstream] hard-coded in test_seesr.load_tag_model(); NOT configurable
+  # without editing upstream code. Listed here so the wrapper can check that it
+  # exists before loading anything.
+  ram_pretrained_path: preset/models/ram_swin_large_14m.pth
+
+dataset:
+  name: RealSR                                # [user]
+  split: test                                 # [user]
+  lr_dir: preset/datasets/RealSR/test_LR      # [user] input LR images only
+  gt_dir: preset/datasets/RealSR/test_HR      # [user] null for unpaired sets (RealLR200)
+  # [exp] suffixes removed from filename stems before SR/GT matching,
+  # e.g. ["_LR4", "_HR"] for the original RealSR naming. Empty = exact stems.
+  strip_suffixes: []
+
+inference:
+  # Every key below is passed to upstream test_seesr.main() unchanged.
+  prompt: ""                                  # [upstream] argparse default. NOTE: scripts/test_seesr.sh passes
+                                              #   "None", which inserts the literal word into every prompt.
+  added_prompt: "clean, high-resolution, 8k"  # [upstream]
+  negative_prompt: "dotted, noise, blur, lowres, smooth"  # [upstream]
+  mixed_precision: fp16                       # [upstream] no | fp16 | bf16
+  guidance_scale: 5.5                         # [upstream]
+  conditioning_scale: 1.0                     # [upstream]
+  blending_alpha: 1.0                         # [upstream] parsed but unused by upstream code
+  num_inference_steps: 50                     # [upstream]
+  process_size: 512                           # [upstream]
+  vae_decoder_tiled_size: 224                 # [upstream] latent size ("for 24G" in upstream comment)
+  vae_encoder_tiled_size: 1024                # [upstream] image size ("for 13G" in upstream comment)
+  latent_tiled_size: 96                       # [upstream]
+  latent_tiled_overlap: 4                     # [upstream]
+  upscale: 4                                  # [upstream]
+  seed: 42                                    # [exp] upstream default is null (unseeded)
+  sample_times: 1                             # [upstream]
+  align_method: adain                         # [upstream] wavelet | adain | nofix
+  start_steps: 999                            # [upstream] NOT forwarded by test_seesr.main(); the pipeline
+                                              #   always uses its own default (999). Wrapper rejects other values.
+  start_point: lr                             # [upstream] LR-embedded start (LRE)
+  save_prompts: true                          # [exp] upstream default false; only writes prompt .txt files
+
+runtime:
+  # [upstream] test_seesr.main() hard-codes the DDPMScheduler loaded from
+  # <pretrained_model_path>/scheduler. Recorded for provenance; the wrapper
+  # refuses any other value.
+  scheduler: DDPMScheduler
+  # [exp] null for every main experiment. Only the separate efficiency experiment (efficiency_sweep.yaml)
+  # sets DDIMScheduler or DPMSolverMultistepScheduler: the wrapper then replaces the loaded DDPMScheduler
+  # with Class.from_config(<same config>). Their effect on quality is unknown until measured.
+  sampler_override: null
+  # [upstream] main() defaults to true and raises if xformers is missing.
+  # true | false | auto  (auto = xformers if importable, else PyTorch SDPA).
+  # SDPA is numerically different from xformers; the backend used is recorded.
+  enable_xformers: true
+  # [upstream] false: upstream seeds ONE generator once, so the noise used for image k depends on
+  # every earlier image and on how many DDPM steps each consumed (DDPMScheduler.step draws noise
+  # every step). true: [exp] before each image, reseed the generator and the global RNG with
+  # image_seed(seed, image name), making an image's noise identical across step counts and
+  # subsets. Used by sampling_sweep.yaml (track B); keep false here (track A, reproduction).
+  reseed_per_image: false
+
+method:
+  # Confidence- and Fidelity-Aware SeeSR (cfa_seesr/). [exp] All components are disabled here, so no hook
+  # is installed and upstream code runs unchanged. Variants in sampling_sweep.yaml enable them.
+  semantic_confidence:
+    enabled: false
+    temperature: 1.0          # T, log-odds units of the margin z_i - logit(tau_i)
+    min_confidence: 0.5       # c_min; 0.5 reproduces upstream tag selection
+    soft_scale_min: 1.0       # s_min; s_min = s_max = 1 leaves the soft-prompt pathway unchanged
+    soft_scale_max: 1.0       # s_max
+    aggregate: mean           # mean | min over the upstream tag set
+  lr_guidance:
+    enabled: false
+    schedule: constant        # constant | power
+    scale_start: 1.0          # factor at t = T (start of sampling)
+    scale_end: 1.0            # factor at t = 0
+    gamma: 1.0
+  spatial_semantic:           # spatial semantic reliability (cfa_seesr/spatial_reliability.py)
+    enabled: false
+    contrast: 0.0             # lambda; 0 = no spatial redistribution (component A / upstream unchanged)
+    smoothing_sigma: 1.0      # Gaussian sigma on DAPE's 12x12 attention grid, in cells
+    attention_layer: -1       # tagging-head layer whose cross-attention is read (-1 = last)
+    soft_scale_min: 0.5       # used only when semantic_confidence is disabled
+    soft_scale_max: 1.0       # used only when semantic_confidence is disabled
+    temperature: 1.0          # c_i temperature, used only when semantic_confidence is disabled
+    control: none             # none | shuffled | mean_matched (ablation controls)
+    shuffle_seed: 0
+  sfr_oc:                     # V2: frequency-selective observation consistency (cfa_seesr/observation_consistency.py)
+    enabled: false            # [exp] off: no hook is installed
+    strength: 0.0             # gamma_max in [0, 1]; 0 = exact no-op (control); v2_ablation.yaml uses 0.5 (untuned)
+    band: low                 # low: Delta = gamma * LPF_h(W * LPF_h(z_lr - x0)) | full: gamma * W * (z_lr - x0)
+    lowpass: gaussian         # gaussian (sigma, latent px) | fft (cutoff, fraction of Nyquist)
+    sigma: 3.0                # Gaussian std, latent px (composite of the two passes). Smooth roll-off, not a
+                              # band limit: half amplitude at a period of ~16 latent px = ~128 output px (x8 VAE)
+    cutoff: 0.25
+    schedule: power           # constant | power: (t/T)^power | window: 1 inside [t_min, t_max]
+    power: 1.0
+    t_min: 0                  # no correction below this timestep
+    t_max: 1000
+    reference: extra_encode   # extra_encode: one VAE encode of the conditioning image (default) | pipeline:
+                              # reuse the pipeline's own LR-start posterior (needs start_point lr)
+    precision: output         # output: step(model_output) + c0(t)*Delta (dtype and RNG as V1) | output_carry:
+                              # + fp32 error feedback of the fp16 rounding | model_output: legacy eps' rewrite
+    profile: false            # explicit synchronisation around the timed sections (benchmarks only)
+    save_maps: true           # observation_maps.npz (W, O, indicators at latent resolution)
+    reliability: heuristic    # O from: heuristic (observation_reliability.py) | learned (LORNet) | blend
+    learned:                  # LORNet (cfa_seesr/lornet.py); only read when reliability is learned or blend
+      checkpoint: null        # trained checkpoint (experiments/training/train_lornet.py); required, validated
+      blend: 0.5              # blend: O = blend * O_LORNet + (1 - blend) * O_heuristic
+    observation:              # part A: local observation-reliability analyzer (heuristic, per image)
+      analysis_scale: 4       # area-downsample the conditioning image by this factor (x4 SR: back to LR grid)
+      window: 7
+      weights: {edge_coherence: 1.0, frequency_energy: 1.0, contrast: 1.0, noise: 1.0, sharpness: 1.0}
+      reference_level: 0.02   # absolute normalisation level (luminance std); no per-image rescaling
+      significance: 2.0       # z of the noise-subtraction margin kappa_k = 1 + z * rel. std of statistic k
+      smoothing_sigma: 1.0
+      low_gradient_quantile: 0.5  # noise estimate: Immerkaer residual on the flattest half of the original LR
+      noise_floor: 0.00392156862745098   # 1/255: quantisation floor added to the noise variance
+      presmooth_sigma: 1.0    # sharpness indicator measured after this light Gaussian pre-smoothing
+    fusion:                   # part C: W = clip(w_observation*O + w_semantic*(1 - S) + bias, w_min, w_max)
+      map: fused              # fused | mean_matched (W = mean of fused, control) | uniform (W = 1) | observation | semantic
+      w_observation: 0.5
+      w_semantic: 0.5
+      bias: 0.0
+      w_min: 0.0
+      w_max: 1.0
+      semantic_default: 0.5   # S when neither component A nor SSR is active
+      control: none           # none | shuffled (W permuted in row/column bands: same values, other places)
+      shuffle_block: 8
+      shuffle_seed: 0
+
+output:
+  results_root: experiments/results           # [user] e.g. /content/drive/MyDrive/seesr_experiments on Colab
+
+evaluation:
+  paired_metrics: [psnr, ssim, lpips, dists]  # [exp] need gt_dir
+  noref_metrics: [musiq, clipiqa]             # [exp]
+  # [exp] PSNR/SSIM on the Y channel of YCbCr, no border crop. Change here, not in code,
+  # and keep it identical across every experiment you compare.
+  y_channel: true
+  crop_border: 0
